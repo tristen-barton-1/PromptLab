@@ -38,7 +38,7 @@ with st.sidebar:
 
     backend = st.selectbox(
         "Backend",
-        ["Completions", "Assistants (beta)"],
+        ["Completions", "Assistant"],
         index=0,
         help=(
             "• **Completions**: Fast, single-turn chat. Great for quick tests.\n"
