@@ -27,14 +27,7 @@ st.caption("Write/refine **system instructions** and **prompts**, upload a **doc
 
 # ================= Sidebar: API & Settings =================
 with st.sidebar:
-    st.header("🔐 API & Settings")
-    st.write("Enter an API key (kept only in this session). If left blank, the app runs in **Demo Mode**.")
-
-    api_key = st.text_input(
-        "API Key",
-        type="password",
-        value=os.getenv("OPENAI_API_KEY", "")
-    )
+    st.header("Settings")
 
     backend = st.selectbox(
         "Backend",
