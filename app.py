@@ -11,33 +11,35 @@ import streamlit as st
 from streamlit.components.v1 import html as st_html
 import pdfplumber
 from docx import Document
-
+if "OPENAI_API_KEY" in st.secrets and not os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 try:
-    import streamlit as st
-    if not os.getenv("OPENAI_API_KEY") and "OPENAI_API_KEY" in st.secrets:
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
 except Exception:
-    pass
+    OPENAI_AVAILABLE = False
+    OpenAI = None
 
+API_KEY = os.getenv("OPENAI_API_KEY", "")
 st.set_page_config(page_title="Non-Technical Prompt Lab", page_icon="🧪", layout="wide")
-
 st.title("🧪 Non-Technical Environment for Developing, Testing, and Refining Assistant Prompts")
 st.caption("Write/refine **system instructions** and **prompts**, upload a **document**, and test responses with **document context** — no code required.")
 
-# ================= Sidebar: API & Settings =================
+# ================= Sidebar: Settings =================
 with st.sidebar:
     st.header("Settings")
+    if API_KEY:
+        st.success("Using secret **OPENAI_API_KEY** (hidden).", icon="🔐")
+    else:
+        st.warning("Demo Mode — no API key found in Secrets or env.", icon="⚠️")
 
     backend = st.selectbox(
         "Backend",
-        ["Completions", "Assistant"],
+        ["Completions", "Assistants (beta)"],
         index=0,
-        help=(
-            "• **Completions**: Fast, single-turn chat. Great for quick tests.\n"
-            "• **Assistants (beta)**: Uses the Assistants API run/threads flow. "
-            "Choose this to mirror production behavior."
-        )
+        help=("• **Completions**: Fast, single-turn chat for quick tests.\n"
+              "• **Assistants (beta)**: Uses threads/runs to mirror production behavior.")
     )
 
     model = st.selectbox(
@@ -48,48 +50,33 @@ with st.sidebar:
     )
 
     max_output_tokens = st.slider(
-        "Max output tokens",
-        128, 2048, 512, 64,
-        help="Upper limit on the length of the AI's answer. Higher = potentially longer responses."
+        "Max output tokens", 128, 2048, 512, 64,
+        help="Upper limit on the AI's answer length."
     )
     temperature = st.slider(
-        "Temperature",
-        0.0, 1.0, 0.2, 0.1,
-        help="Lower values make answers more consistent; higher values make them more creative."
+        "Temperature", 0.0, 1.0, 0.2, 0.1,
+        help="Lower = more consistent; higher = more creative."
     )
 
     st.divider()
     st.write("**Retrieval Settings**")
-
     chunk_chars = st.slider(
-        "Chunk size",
-        1000, 6000, 3000, 500,
-        help=(
-            "We split your uploaded document into slices called *chunks*. "
-            "This sets how big each slice is (in characters). Larger chunks include more context "
-            "but can be slower and less targeted. Tip: 2,000–4,000 works well for most RFPs."
-        )
+        "Chunk size", 1000, 6000, 3000, 500,
+        help=("We split your document into slices (*chunks*). "
+              "Bigger chunks include more context but may be slower. "
+              "Tip: 2,000–4,000 works well for most RFPs.")
     )
-
     top_k = st.slider(
-        "Top-K chunks",
-        1, 8, 3,
-        help=(
-            "For each prompt, we pick the **Top-K** most relevant slices of the document to send to the AI. "
-            "Higher values add more context (useful for broad questions) but can slow things down or dilute relevance. "
-            "Tip: start at 3; raise it if answers seem to miss details."
-        )
+        "Top-K chunks", 1, 8, 3,
+        help=("For each prompt, we send the **Top-K** most relevant slices to the AI. "
+              "Higher values add more context but can dilute relevance. Tip: start at 3.")
     )
-
-    st.caption("The app automatically selects the Top-K most relevant chunks per prompt based on simple keyword matching.")
+    st.caption("The app automatically selects the Top-K most relevant chunks per prompt.")
 
     st.divider()
     st.write("**Export Options**")
     export_format = st.multiselect(
-        "Choose export format(s)",
-        ["CSV", "JSON"],
-        default=["CSV", "JSON"],
-        help="Pick the file types you want to download."
+        "Choose export format(s)", ["CSV", "JSON"], default=["CSV", "JSON"]
     )
 
 # ================= Section 1: Instructions & Prompts =================
@@ -218,7 +205,7 @@ def call_openai_completions(messages):
     """Chat Completions backend."""
     if not OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not installed in this environment.")
-    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    client = OpenAI(api_key=API_KEY) if API_KEY else OpenAI()
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -231,7 +218,8 @@ def call_openai_assistants(system_instructions: str, context: str, prompt: str):
     """Assistants (beta) backend — minimal flow: create assistant, thread, run, poll, read reply."""
     if not OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not installed in this environment.")
-    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    client = OpenAI(api_key=API_KEY) if API_KEY else OpenAI()
+
     assistant = client.beta.assistants.create(
         name="BidWERX Prompt Lab",
         instructions=system_instructions or "",
@@ -240,16 +228,9 @@ def call_openai_assistants(system_instructions: str, context: str, prompt: str):
 
     thread = client.beta.threads.create()
     user_content = f"Use this document context:\n\n{context}\n\nUser prompt:\n{prompt}"
-    client.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=user_content
-    )
+    client.beta.threads.messages.create(thread_id=thread.id, role="user", content=user_content)
 
-    run = client.beta.threads.runs.create(
-        thread_id=thread.id,
-        assistant_id=assistant.id
-    )
+    run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=assistant.id)
 
     for _ in range(60):
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
@@ -261,14 +242,12 @@ def call_openai_assistants(system_instructions: str, context: str, prompt: str):
 
     msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
     if msgs.data:
-        content_parts = msgs.data[0].content
-        text_out = []
-        for p in content_parts:
+        out = []
+        for p in msgs.data[0].content:
             if getattr(p, "type", None) == "text":
-                text_out.append(p.text.value)
-        if text_out:
-            return "\n".join(text_out)
-
+                out.append(p.text.value)
+        if out:
+            return "\n".join(out)
     return "(No response returned from Assistants API)"
 
 # ================= Section 3: Run & Review =================
@@ -300,16 +279,14 @@ if run:
             if not prompt:
                 continue
 
-            # --------- NEW: Top-K selection per prompt ---------
             query_for_ranking = f"{prompt} {system_instructions or ''}"
             selected = select_top_k_chunks(chunks, query_for_ranking, k=top_k)
             context = ("\n\n---\n\n").join(selected)
-            # Safety clamp to avoid extremely long contexts
             if len(context) > 12000:
                 context = context[:12000]
 
             try:
-                if api_key:
+                if API_KEY:
                     if backend == "Assistants (beta)":
                         ai_text = call_openai_assistants(system_instructions, context, prompt)
                     else:
@@ -320,7 +297,7 @@ if run:
                         ]
                         ai_text = call_openai_completions(messages)
                 else:
-                    ai_text = "(Demo response) This is a placeholder. With an API key, the model would answer using the document context and your prompt."
+                    ai_text = "(Demo response) This is a placeholder. Add OPENAI_API_KEY in Streamlit Secrets to enable live calls."
             except TypeError as e:
                 if "proxies" in str(e):
                     ai_text = ("ERROR: HTTP client compatibility issue detected. "
@@ -345,28 +322,20 @@ if run:
         st.session_state["results"] = results
         st.success("Completed. Review results below.")
 
-# ======== Report builders ================
+# ================= Report builders =================
 def build_markdown_report(title, system_instructions, doc_name, results):
     lines = [
-        f"# {title}",
-        "",
-        f"**Document:** {doc_name or '—'}",
-        "",
-        "## System Instructions",
-        "",
-        system_instructions or "_None_",
-        "",
-        "## Results",
-        "",
+        f"# {title}", "",
+        f"**Document:** {doc_name or '—'}", "",
+        "## System Instructions", "",
+        system_instructions or "_None_", "",
+        "## Results", "",
     ]
     for i, r in enumerate(results, 1):
         lines += [
-            f"### {i}. {r.get('prompt','')}",
-            "",
-            "**AI Response**",
-            "",
-            r.get("ai_response",""),
-            "",
+            f"### {i}. {r.get('prompt','')}", "",
+            "**AI Response**", "",
+            r.get("ai_response",""), "",
         ]
         if r.get("expected_result"):
             lines += ["**Expected Result (notes)**", "", r["expected_result"], ""]
@@ -377,7 +346,7 @@ def build_html_report(title, system_instructions, doc_name, results):
     <style>
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.55;color:#222;
            max-width:980px;margin:2rem auto;padding:0 1rem;}
-      h1,h2,h3{margin:.4rem 0 0.6rem}
+      h1,h2,h3{margin:.4rem 0 .6rem}
       .meta{color:#555;margin:.3rem 0 1rem;font-size:.95rem}
       .card{border:1px solid #eaecef;border-radius:12px;padding:16px;margin:16px 0;
             box-shadow:0 1px 2px rgba(0,0,0,.04)}
@@ -507,5 +476,5 @@ with st.expander("ℹ️ Notes & Tips"):
     - Retrieval is enabled: the app selects **Top-K** relevant chunks per prompt.
     - Toggle **Backend** between **Completions** and **Assistants (beta)** in the sidebar.
     - For scanned PDFs, consider adding OCR if parsing returns little/no text.
-    - API key is session-only here; for production, use environment variables or a secrets manager.
+    - API key is provided via **Streamlit Secrets** and never shown in the UI.
     """)
