@@ -6,7 +6,7 @@ REM BidWERX Prompt Lab (MVP) - Windows Launcher
 REM ============================================
 
 REM 0) Go to the project folder
-cd /d "D:\VTW Files\Prompt Lab"
+cd /d "C:\Users\trist\Documents\GitHub\PromptLab"
 
 echo.
 echo === BidWERX Prompt Lab Launcher ===
