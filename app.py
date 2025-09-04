@@ -4,7 +4,7 @@ import time
 import json
 import html, csv
 from io import BytesIO
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -72,7 +72,9 @@ if "prompts_df" not in st.session_state:
 if "file_refs" not in st.session_state:
     st.session_state["file_refs"] = []  # [{'file_id','name','size'}]
 if "results" not in st.session_state:
-    st.session_state["results"] = []
+    st.session_state["results"] = []    # list of result dicts
+if "export_format" not in st.session_state:
+    st.session_state["export_format"] = ["CSV", "JSON"]
 
 saved_df = st.session_state["prompts_df"]
 
@@ -123,11 +125,11 @@ with st.sidebar:
         temperature = st.slider("Temperature (default)", 0.0, 1.0, 0.2, 0.1)
         top_p_default = st.slider("Top-p (default)", 0.0, 1.0, 1.0, 0.05)
 
-    max_output_tokens = st.slider("Max output tokens (default)", 64, 8192, 1024, 64)
+    max_output_tokens = st.slider("Max output tokens (default)", 64, 8192, 2048, 64)
 
     st.divider()
     st.write("**Export Options**")
-    export_format = st.multiselect("Choose export format(s)", ["CSV", "JSON"], default=["CSV", "JSON"])
+    export_format = st.multiselect("Choose export format(s)", ["CSV", "JSON"], default=st.session_state["export_format"])
     st.session_state["export_format"] = export_format
 
 # ================= Section 1: Instructions & Prompts =================
@@ -135,20 +137,30 @@ st.markdown("## 1) Instructions & Prompts")
 
 system_instructions = st.text_area(
     "System Instructions",
-    value="You are an expert RFP analysis assistant. Identify key requirements, deadlines, evaluation criteria, compliance obligations, and risks. Cite sections when possible and provide actionable recommendations. Always start your responses with 'GLOBAL ANALYSIS:' prefix.",
+    value=st.session_state.get(
+        "system_instructions",
+        "You are an expert RFP analysis assistant. Identify key requirements, deadlines, evaluation criteria, compliance obligations, and risks. Cite sections when possible and provide actionable recommendations. Always start your responses with 'GLOBAL ANALYSIS:' prefix.",
+    ),
     height=120,
     key="system_instructions",
 )
 
 global_prompt = st.text_area(
     "Global Prompt",
-    value="Provide a comprehensive analysis of the uploaded documents, focusing on key insights and actionable recommendations.",
+    value=st.session_state.get(
+        "global_prompt",
+        "Provide a comprehensive analysis of the uploaded documents, focusing on key insights and actionable recommendations.",
+    ),
     height=80,
     key="global_prompt",
 )
 
-# Prompt editor
-hide_sampling_cols = sampling_globally_disabled
+# Prompt editor (stable schema; no column dropping)
+REQUIRED_COLS = ["prompt", "system_instructions", "expected_result", "model", "backend", "max_tokens", "temperature", "top_p"]
+for col in REQUIRED_COLS:
+    if col not in st.session_state["prompts_df"].columns:
+        st.session_state["prompts_df"][col] = ""
+
 column_cfg = {
     "prompt": st.column_config.TextColumn("Prompt", width="medium"),
     "system_instructions": st.column_config.TextColumn("System Instructions (overrides global)", width="medium"),
@@ -157,7 +169,7 @@ column_cfg = {
     "backend": st.column_config.SelectboxColumn("Backend (optional per prompt)", options=["", "Completions", "Assistants", "Responses"]),
     "max_tokens": st.column_config.NumberColumn("Max tokens (optional)", min_value=64, max_value=8192, step=64),
 }
-if not hide_sampling_cols:
+if not sampling_globally_disabled:
     column_cfg["temperature"] = st.column_config.NumberColumn("Temp (0–1, optional)", min_value=0.0, max_value=1.0, step=0.1, format="%.1f")
     column_cfg["top_p"] = st.column_config.NumberColumn("Top-p (0–1, optional)", min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
 
@@ -170,44 +182,39 @@ def _prepare_editor_df(df: pd.DataFrame, hide_sampling: bool) -> pd.DataFrame:
         return df2.drop(columns=[c for c in ["temperature", "top_p"] if c in df2.columns], errors="ignore")
     return df2
 
-editor_input_df = _prepare_editor_df(saved_df, hide_sampling_cols)
-if "model" in editor_input_df.columns and "model" in saved_df.columns:
-    for idx in range(min(len(editor_input_df), len(saved_df))):
-        if saved_df.iloc[idx].get("model") and str(saved_df.iloc[idx].get("model")).strip():
-            editor_input_df.at[idx, "model"] = saved_df.iloc[idx].get("model")
-
+editor_input_df = _prepare_editor_df(st.session_state["prompts_df"], sampling_globally_disabled)
 prompts_df_view = st.data_editor(
-    editor_input_df, num_rows="dynamic", use_container_width=True, column_config=column_cfg, key="prompts_editor"
+    editor_input_df,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config=column_cfg,
+    key="prompts_editor"
 )
 
-def _merge_back(edited: pd.DataFrame, original: pd.DataFrame, hide_sampling: bool) -> pd.DataFrame:
-    merged = original.copy()
-    editable_cols = set(edited.columns)
-    for c in list(merged.columns):
-        if c in editable_cols:
-            edited_val = edited[c]
-            if edited_val is not None and str(edited_val).strip() != "":
-                merged[c] = edited_val
-            elif c in ["model", "backend"] and merged[c] is not None and str(merged[c]).strip() != "":
-                pass
-    for col in ["prompt", "system_instructions", "expected_result", "model", "backend", "max_tokens"]:
-        if col not in merged.columns:
-            merged[col] = ""
-    if not hide_sampling:
-        for col in ["temperature", "top_p"]:
-            if col not in merged.columns:
-                merged[col] = ""
+# Write back edits to the single source of truth
+def _merge_back(edited: pd.DataFrame, original: pd.DataFrame) -> pd.DataFrame:
+    # Simply use the edited dataframe as the new state
+    # This allows proper row deletion and addition
+    merged = edited.copy()
+    
+    # Ensure all required columns exist
+    for c in REQUIRED_COLS:
+        if c not in merged.columns:
+            merged[c] = ""
+    
+    # Remove completely empty rows (all values are NaN or empty string)
+    merged = merged.dropna(how='all')
+    merged = merged[~(merged == '').all(axis=1)]
+    
     return merged
 
-prompts_df = _merge_back(prompts_df_view, saved_df, hide_sampling_cols)
-st.session_state["prompts_df"] = prompts_df
-saved_df = prompts_df.copy()
+st.session_state["prompts_df"] = _merge_back(prompts_df_view, st.session_state["prompts_df"])
 
 # ================= Section 2: Upload files (no local parsing) =================
-st.markdown("## 2) Upload Files (PDF, DOCX, TXT, etc.) — SDK will read them directly")
+st.markdown("## 2) Upload Files (PDF, DOCX, TXT, etc.)")
 
 uploaded = st.file_uploader(
-    "Drop files or click to upload. Files are uploaded to OpenAI and then used as inputs for each prompt.",
+    "",
     type=None,
     key="doc_uploader",
     accept_multiple_files=True
@@ -243,10 +250,7 @@ if uploaded:
             st.warning(f"Skipped upload (no API key): {f.name}")
 
 file_refs = st.session_state.get("file_refs", [])
-if file_refs:
-    st.info(f"📎 Files attached for grounding: {', '.join([r['name'] for r in file_refs])}")
-else:
-    st.info("📎 No files uploaded yet.")
+
 
 # ================= Helpers for model calls =================
 def build_filename_preamble(files: List[Dict[str, Any]]) -> str:
@@ -410,7 +414,6 @@ def call_openai_assistants(system_instructions: str, prompt: str, model_id: str)
     )
 
     run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=assistant.id)
-    # quick-poll loop
     for _ in range(60):
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
         if run.status == "completed":
@@ -438,69 +441,103 @@ def _coalesce_num(val, default, cast=float):
     except Exception:
         return cast(default)
 
-# ================= Section 3: Run & Review (incremental in ONE run) =================
-st.markdown("## 3) Run Tests")
+def _safe_str(val, default=""):
+    """Safely convert a value to string, handling NaN and None values."""
+    if pd.isna(val) or val is None:
+        return default
+    return str(val).strip()
 
-run_clicked = st.button("▶️ Run Prompts", type="primary", use_container_width=True)
+def render_card(container: st.delta_generator.DeltaGenerator, result: Dict[str, Any], expand: bool = False):
+    """Stable card renderer (single format)."""
+    files_line = result.get("documents") or "—"
+    title = (result.get("prompt") or "(no prompt)")[:120]
+    with container.expander(f"🧪 {title}", expanded=expand):
+        st.markdown(f"**Files:** {files_line}")
+        st.markdown(
+            f"**Backend:** {result.get('backend','')}  |  **Model:** {result.get('model_label') or result.get('model_id','')}  \n"
+            f"**Temp:** {result.get('temperature_used','')}  |  **Top-p:** {result.get('top_p_used','')}  |  "
+            f"**Max tokens:** {result.get('max_tokens_used','')}"
+        )
+        st.markdown("**AI Response:**")
+        st.markdown(result.get("ai_response",""))
 
-if run_clicked:
-    st.session_state["results"] = []  # reset
+# ================= Section 3: Run Tests & Results (single live/persistent area) =================
+st.markdown("## 3) Run Tests & Results")
 
-if run_clicked:
-    # Basic validation
+# This is the ONLY place results are rendered (both during runs and on reruns)
+cards_root = st.container()
+
+# Show button only when not processing
+run_clicked = False
+button_placeholder = st.empty()
+
+if not st.session_state.get("processing", False):
+    run_clicked = button_placeholder.button("▶️ Run Prompts", type="primary", use_container_width=True)
+    if run_clicked:
+        st.session_state["processing"] = True
+        button_placeholder.empty()  # Clear the button immediately
+else:
+    button_placeholder.empty()  # Clear the button when processing
+
+if run_clicked or st.session_state.get("processing", False):
+    # Reset results only when starting a new run
+    st.session_state["results"] = []
+
+    # Validate
+    files = st.session_state.get("file_refs", [])
     if not system_instructions.strip():
         st.warning("Please provide system instructions.")
-    elif saved_df.empty and not global_prompt.strip():
+        st.session_state["processing"] = False
+    elif st.session_state["prompts_df"].empty and not global_prompt.strip():
         st.warning("Please provide at least one prompt in the table or a global prompt.")
-    elif not file_refs:
+        st.session_state["processing"] = False
+    elif not files:
         st.warning("Please upload at least one file for grounding.")
+        st.session_state["processing"] = False
     else:
         # Freeze work items from the edited table
-        df = st.session_state["prompts_df"]
+        df_now = st.session_state["prompts_df"]
         work_items: List[Dict[str, Any]] = []
-        for _, row in df.iterrows():
-            prompt_text = (row.get("prompt") or "").strip() or global_prompt.strip()
+        for _, row in df_now.iterrows():
+            prompt_text = _safe_str(row.get("prompt")) or global_prompt.strip()
             if not prompt_text:
                 continue
-            item = {
+            work_items.append({
                 "prompt": prompt_text,
-                "expected_result": (row.get("expected_result") or "").strip(),
-                "model_display": (row.get("model") or "").strip() or default_model_display,
-                "backend": (row.get("backend") or "").strip() or backend,
-                "system_instructions": (row.get("system_instructions") or "").strip() or system_instructions,
+                "expected_result": _safe_str(row.get("expected_result")),
+                "model_display": _safe_str(row.get("model")) or default_model_display,
+                "backend": _safe_str(row.get("backend")) or backend,
+                "system_instructions": _safe_str(row.get("system_instructions")) or system_instructions,
                 "temperature": _coalesce_num(row.get("temperature"), 0.2 if not sampling_globally_disabled else 0.0, float),
                 "top_p": _coalesce_num(row.get("top_p"), 1.0, float),
                 "max_tokens": _coalesce_num(row.get("max_tokens"), max_output_tokens, int),
-            }
-            work_items.append(item)
+            })
 
         total = len(work_items)
         if total == 0:
             st.warning("No valid prompts found to process.")
         else:
-            # ---- Show immediate “Started…” indicator BEFORE first call
+            # Progress indicator visible immediately
             progress_ph = st.empty()
             progress_ph.progress(0, text=f"Started… (0 of {total})")
 
-            cards_container = st.container()
-            # Pre-create individual card placeholders (so they occupy space and appear as soon as they’re ready)
-            card_placeholders = [cards_container.container() for _ in range(total)]
+            # Pre-create placeholders for live cards inside the SINGLE cards area
+            card_placeholders = [cards_root.container() for _ in range(total)]
 
-            # Process each prompt sequentially and fill its card placeholder
+            # Process prompts sequentially and render each card as it completes
             for i, item in enumerate(work_items, start=1):
-                # Optional: a tiny sleep can help the front-end paint the initial state
-                time.sleep(0.05)
+                time.sleep(0.03)  # small yield for UI
+
+                model_id = resolve_model_id(item["model_display"])
+                used_backend = item["backend"]
+                notes = []
+                if used_backend == "Completions" and is_gpt5(model_id):
+                    used_backend = "Responses"
+                    notes.append("⚠️ Auto-routed from Completions to Responses for GPT-5.")
+                if is_gpt5(model_id):
+                    notes.append("⚠️ GPT-5: Temperature / Top-p are not applied.")
 
                 try:
-                    model_id = resolve_model_id(item["model_display"])
-                    used_backend = item["backend"]
-                    notes = []
-                    if used_backend == "Completions" and is_gpt5(model_id):
-                        used_backend = "Responses"
-                        notes.append("⚠️ Auto-routed from Completions to Responses for GPT-5.")
-                    if is_gpt5(model_id):
-                        notes.append("⚠️ GPT-5: Temperature / Top-p are not applied.")
-
                     if used_backend == "Assistants":
                         ai_text = call_openai_assistants(item["system_instructions"], item["prompt"], model_id)
                     elif used_backend == "Responses":
@@ -509,7 +546,6 @@ if run_clicked:
                             item["max_tokens"], item["temperature"], item["top_p"]
                         )
                     else:
-                        # Completions (non-GPT-5). No retrieval/files here.
                         messages = [
                             {"role": "system", "content": item["system_instructions"] or ""},
                             {"role": "user", "content": item["prompt"]},
@@ -517,16 +553,14 @@ if run_clicked:
                         ai_text = call_openai_completions(
                             messages, model_id, item["max_tokens"], item["temperature"], item["top_p"]
                         )
-
                     if notes:
                         ai_text = ("\n\n".join(notes) + "\n\n" + (ai_text or "")).strip()
-
                 except Exception as e:
                     ai_text = f"ERROR: {e}"
 
-                # Save to results (for later exports)
-                st.session_state["results"].append({
-                    "documents": ", ".join([r["name"] for r in file_refs]) if file_refs else "",
+                # Persist and immediately render this card
+                result_row = {
+                    "documents": ", ".join([r["name"] for r in files]) if files else "",
                     "system_instructions": item["system_instructions"],
                     "prompt": item["prompt"],
                     "expected_result": item["expected_result"],
@@ -537,55 +571,31 @@ if run_clicked:
                     "top_p_used": "(ignored for GPT-5)" if is_gpt5(model_id) else item["top_p"],
                     "max_tokens_used": item["max_tokens"],
                     "ai_response": ai_text
-                })
+                }
+                st.session_state["results"].append(result_row)
 
-                # ---- Render this card immediately
-                with card_placeholders[i-1]:
-                    title = (item["prompt"] or "")[:120] or "(no prompt)"
-                    with st.expander(f"🧪 {title}", expanded=True if i == 1 else False):
-                        st.markdown(f"**Files:** {', '.join([f['name'] for f in file_refs]) if file_refs else '—'}")
-                        st.markdown(
-                            f"**Backend:** {used_backend}  |  **Model:** {item['model_display']}  \n"
-                            f"**Temp:** {st.session_state['results'][-1]['temperature_used']}  |  "
-                            f"**Top-p:** {st.session_state['results'][-1]['top_p_used']}  |  "
-                            f"**Max tokens:** {item['max_tokens']}"
-                        )
-                        st.markdown("**AI Response:**")
-                        st.markdown(ai_text)
+                render_card(card_placeholders[i-1], result_row, expand=(i == 1))
 
-                # ---- Update progress bar after each prompt
                 pct = int((i / total) * 100)
                 progress_ph.progress(pct, text=f"Processed {i} of {total}")
 
-            # Finished
             progress_ph.progress(100, text=f"Completed {total} of {total}")
+            # Clear processing flag when done
+            st.session_state["processing"] = False
 
-# ================= Section 4: Results & Export =================
-st.markdown("## 4) Results & Export")
+else:
+    # No new run: render whatever is already in session (single area, no duplicates)
+    existing_results = st.session_state.get("results", [])
+    if existing_results:
+        for res in existing_results:
+            slot = cards_root.container()
+            render_card(slot, res, expand=False)
 
-results = st.session_state.get("results", [])
+# ======= Downloads =======
 files_for_view = st.session_state.get("file_refs", [])
-
+results = st.session_state.get("results", [])
 if results:
-    # Static cards tab + exports (post-run)
-    tabs = st.tabs(["🗂 Cards", "📊 Table", "🖨 Report Preview"])
-    with tabs[0]:
-        st.markdown("#### Results (readable cards)")
-        for r in results:
-            title = (r.get("prompt") or "")[:120] or "(no prompt)"
-            with st.expander(f"🧪 {title}"):
-                st.markdown(f"**Files:** {', '.join([f['name'] for f in files_for_view]) if files_for_view else '—'}")
-                st.markdown(
-                    f"**Backend:** {r.get('backend','')}  |  **Model:** {r.get('model_label','') or r.get('model_id','')}  \n"
-                    f"**Temp:** {r.get('temperature_used','')}  |  **Top-p:** {r.get('top_p_used','')}  |  "
-                    f"**Max tokens:** {r.get('max_tokens_used','')}"
-                )
-                st.markdown("**AI Response:**")
-                st.markdown(r.get("ai_response", ""))
-
-    with tabs[1]:
-        st.markdown("#### Raw table")
-        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+    st.markdown("### Download Results")
 
     def build_markdown_report(title, system_instructions, files, results):
         lines = [
@@ -677,17 +687,6 @@ if results:
         d.save(bio)
         return bio.getvalue()
 
-    with tabs[2]:
-        st.markdown("#### Print-friendly Markdown (preview)")
-        _md_preview = build_markdown_report(
-            "BidWERX Prompt Lab — Test Run",
-            st.session_state.get("system_instructions"),
-            files_for_view,
-            results
-        )
-        st.markdown(_md_preview)
-
-    st.markdown("### Download")
     md_text   = build_markdown_report("BidWERX Prompt Lab — Test Run", st.session_state.get("system_instructions"), files_for_view, results)
     html_bytes = build_html_report("BidWERX Prompt Lab — Test Run", st.session_state.get("system_instructions"), files_for_view, results)
     docx_bytes = build_docx_report("BidWERX Prompt Lab — Test Run", st.session_state.get("system_instructions"), files_for_view, results)
@@ -705,5 +704,3 @@ if results:
     st.download_button("⬇️ Download DOCX (Word)", data=docx_bytes,
                        file_name="prompt_lab_report.docx",
                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-else:
-    st.info("Run prompts to see results here.")
